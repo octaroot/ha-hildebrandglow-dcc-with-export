@@ -123,6 +123,8 @@ def supply_type(resource) -> str:
         return "electricity"
     if "gas.consumption" in resource.classifier:
         return "gas"
+    if "electricity.export" in resource.classifier:
+        return "export"
     _LOGGER.error("Unknown classifier: %s. Please open an issue", resource.classifier)
     return "unknown"
 
@@ -522,7 +524,7 @@ async def async_setup_entry(
             _LOGGER.debug(
                 "Processing resource with classifier: %s", resource.classifier
             )
-            if resource.classifier in ["electricity.consumption", "gas.consumption"]:
+            if resource.classifier in ["electricity.consumption", "gas.consumption", "electricity.export"]:
                 coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
                 if coordinator_key not in daily_coordinators:
                     daily_coordinators[coordinator_key] = DataCoordinator(
