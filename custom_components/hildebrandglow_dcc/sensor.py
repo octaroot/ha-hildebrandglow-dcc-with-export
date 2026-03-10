@@ -72,6 +72,46 @@ class DataCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Unknown error fetching daily data: {ex}") from ex
 
 
+class ExportDataCoordinator(DataUpdateCoordinator):
+    """Data update coordinator for export sensors.
+
+    Fetches yesterday's settled export data since DCC export data
+    is typically delayed by up to 24 hours.
+    """
+
+    def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
+        """Initialize export data coordinator."""
+        self.resource = glowmarkt_resource
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"Export Data {glowmarkt_resource.classifier}",
+            update_interval=timedelta(minutes=daily_interval),
+        )
+
+    async def _async_update_data(self):
+        """Fetch yesterday's export data from API endpoint."""
+        _LOGGER.debug(
+            "ExportDataCoordinator updating for resource %s", self.resource.classifier
+        )
+        try:
+            value = await daily_export_data(self.hass, self.resource)
+            if value is None:
+                return None
+            return value
+        except HTTPError as ex:
+            raise UpdateFailed(
+                f"HTTP Error fetching export data: {ex}, Status Code: {ex.response.status_code}"
+            ) from ex
+        except Timeout as ex:
+            raise UpdateFailed(f"Timeout fetching export data: {ex}") from ex
+        except ConnectionError as ex:
+            raise UpdateFailed(f"Connection error fetching export data: {ex}") from ex
+        except Exception as ex:
+            _LOGGER.exception("Unexpected exception fetching export data: %s", ex)
+            raise UpdateFailed(f"Unknown error fetching export data: {ex}") from ex
+
+
 class TariffCoordinator(DataUpdateCoordinator):
     """Data update coordinator for the tariff sensors."""
 
@@ -121,10 +161,10 @@ def supply_type(resource) -> str:
     """Return supply type."""
     if "electricity.consumption" in resource.classifier:
         return "electricity"
+    if "electricity.export" in resource.classifier:
+        return "electricity"
     if "gas.consumption" in resource.classifier:
         return "gas"
-    if "electricity.export" in resource.classifier:
-        return "export"
     _LOGGER.error("Unknown classifier: %s. Please open an issue", resource.classifier)
     return "unknown"
 
@@ -217,7 +257,84 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
         return None
 
 
-async def tariff_data(hass: HomeAssistant, resource):
+async def daily_export_data(hass: HomeAssistant, resource) -> float:
+    """Get yesterday's export total from the API.
+
+    Export data from the DCC is typically delayed by up to 24 hours,
+    so we fetch yesterday's settled data rather than today's incomplete data.
+    """
+    _LOGGER.debug("Fetching yesterday's export data")
+    now = dt_util.utcnow()
+    utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
+
+    try:
+        await hass.async_add_executor_job(resource.catchup)
+        _LOGGER.debug(
+            "Successful GET to https://api.glowmarkt.com/api/v0-1/resource/%s/catchup",
+            resource.id,
+        )
+    except HTTPError as ex:
+        _LOGGER.error("HTTP Error: %s, Status Code: %s", ex, ex.response.status_code)
+    except Timeout as ex:
+        _LOGGER.error("Timeout: %s", ex)
+    except ConnectionError as ex:
+        _LOGGER.error("Cannot connect: %s", ex)
+    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+
+    # Yesterday midnight to today midnight (local time, adjusted to UTC)
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        minutes=utc_offset
+    )
+    yesterday_midnight = today_midnight - timedelta(days=1)
+
+    try:
+        _LOGGER.debug(
+            "Get export readings from %s to %s for %s",
+            yesterday_midnight,
+            today_midnight,
+            resource.classifier,
+        )
+        readings = await hass.async_add_executor_job(
+            resource.get_readings,
+            yesterday_midnight,
+            today_midnight,
+            "P1D",
+            "sum",
+            utc_offset,
+        )
+        _LOGGER.debug(
+            "Successfully got export data for resource id %s", resource.id
+        )
+        if not readings:
+            _LOGGER.debug("No export readings returned for yesterday")
+            return None
+
+        v = readings[0][1].value
+        _LOGGER.debug(
+            "%s Export reading: %s",
+            resource.classifier,
+            v,
+        )
+        if len(readings) > 1:
+            v += readings[1][1].value
+        return v
+    except HTTPError as ex:
+        _LOGGER.error(
+            "HTTP Error fetching export data: %s, Status Code: %s",
+            ex,
+            ex.response.status_code,
+        )
+        return None
+    except Timeout as ex:
+        _LOGGER.error("Timeout: %s", ex)
+        return None
+    except ConnectionError as ex:
+        _LOGGER.error("Cannot connect: %s", ex)
+        return None
+    except Exception as ex:
+        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+        return None
     """Get tariff data from the API."""
     try:
         tariff = await hass.async_add_executor_job(resource.get_tariff)
@@ -366,6 +483,46 @@ class Cost(GlowDCCSensor):
     def _update_native_value(self, data: float) -> None:
         """Set the native value for cost sensor from coordinator data."""
         self._attr_native_value = round(data / 100, 2)
+
+
+class Export(GlowDCCSensor):
+    """Sensor object for daily electricity export.
+
+    Shows yesterday's settled export data since DCC export data
+    is typically delayed by up to 24 hours.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_has_entity_name = True
+    _attr_name = "Export (yesterday)"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:solar-power"
+
+    def __init__(
+        self, coordinator: DataUpdateCoordinator, resource, virtual_entity
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, resource, virtual_entity)
+        self._attr_unique_id = f"{resource.id}_export_today"
+        _LOGGER.debug(
+            "Created Export sensor with unique_id: %s", self._attr_unique_id
+        )
+
+    @callback
+    def _update_native_value(self, data: float) -> None:
+        """Set the native value for export sensor from coordinator data."""
+        self._attr_native_value = round(data, 2)
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information, grouped with the electricity meter."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.resource.id)},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=device_name(self.resource, self.virtual_entity),
+        )
 
 
 class Standing(CoordinatorEntity, SensorEntity):
@@ -524,7 +681,7 @@ async def async_setup_entry(
             _LOGGER.debug(
                 "Processing resource with classifier: %s", resource.classifier
             )
-            if resource.classifier in ["electricity.consumption", "gas.consumption", "electricity.export"]:
+            if resource.classifier in ["electricity.consumption", "gas.consumption"]:
                 coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
                 if coordinator_key not in daily_coordinators:
                     daily_coordinators[coordinator_key] = DataCoordinator(
@@ -567,6 +724,24 @@ async def async_setup_entry(
                 entities.append(rate_sensor)
                 _LOGGER.debug(
                     "Added Rate sensor to list for entity %s", resource.classifier
+                )
+
+            elif resource.classifier == "electricity.export":
+                coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
+                if coordinator_key not in daily_coordinators:
+                    daily_coordinators[coordinator_key] = ExportDataCoordinator(
+                        hass, resource, daily_interval
+                    )
+                    hass.async_create_task(
+                        _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
+                    )
+
+                export_sensor = Export(
+                    daily_coordinators[coordinator_key], resource, virtual_entity
+                )
+                entities.append(export_sensor)
+                _LOGGER.debug(
+                    "Added Export sensor to list for entity %s", resource.classifier
                 )
 
         for resource in resources:

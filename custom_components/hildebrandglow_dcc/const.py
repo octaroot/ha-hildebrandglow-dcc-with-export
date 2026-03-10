@@ -7,12 +7,11 @@ ELEC_CONSUMPTION_CLASSIFIER = "electricity.consumption"
 GAS_CONSUMPTION_CLASSIFIER = "gas.consumption"
 ELEC_COST_CLASSIFIER = "electricity.consumption.cost"
 GAS_COST_CLASSIFIER = "gas.consumption.cost"
-EXPORT_CLASSIFIER = "electricity.export"
+ELEC_EXPORT_CLASSIFIER = "electricity.export"
 
 # Device Types
 ELECTRIC_METER = "electric_meter"
 GAS_METER = "gas_meter"
-EXPORT_METER = "electric_meter"
 
 # ADD THESE LINES
 CONF_DAILY_INTERVAL = "daily_interval"
