@@ -75,13 +75,16 @@ class DataCoordinator(DataUpdateCoordinator):
 class ExportDataCoordinator(DataUpdateCoordinator):
     """Data update coordinator for export sensors.
 
-    Fetches yesterday's settled export data since DCC export data
-    is typically delayed by up to 24 hours.
+    Fetches half-hourly export data and imports it into HA's long-term
+    statistics via async_import_statistics, ensuring data is attributed
+    to the correct timestamps even when the DCC data arrives late.
+    Also provides today's/yesterday's total as a fallback sensor value.
     """
 
     def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
         """Initialize export data coordinator."""
         self.resource = glowmarkt_resource
+        self._statistic_id = None  # Set by the Export sensor after creation
         super().__init__(
             hass,
             _LOGGER,
@@ -90,11 +93,16 @@ class ExportDataCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self):
-        """Fetch yesterday's export data from API endpoint."""
+        """Fetch export data and import historical statistics."""
         _LOGGER.debug(
             "ExportDataCoordinator updating for resource %s", self.resource.classifier
         )
         try:
+            # Import historical half-hourly data into HA statistics
+            if self._statistic_id:
+                await self._import_export_statistics()
+
+            # Also return today's/yesterday's value for the sensor display
             value = await daily_export_data(self.hass, self.resource)
             if value is None:
                 return None
@@ -110,6 +118,111 @@ class ExportDataCoordinator(DataUpdateCoordinator):
         except Exception as ex:
             _LOGGER.exception("Unexpected exception fetching export data: %s", ex)
             raise UpdateFailed(f"Unknown error fetching export data: {ex}") from ex
+
+    async def _import_export_statistics(self):
+        """Fetch half-hourly export data for the last 2 days and import as statistics."""
+        from homeassistant.components.recorder.models import StatisticData, StatisticMetaData  # noqa: E501
+        from homeassistant.components.recorder.statistics import (
+            async_import_statistics,
+            statistics_during_period,
+            get_instance,
+        )
+
+        now = dt_util.utcnow()
+        utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
+
+        # Fetch last 2 days of half-hourly data to catch delayed DCC data
+        t_from = (now - timedelta(days=2)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(minutes=utc_offset)
+        t_to = now.replace(second=0, microsecond=0)
+
+        try:
+            readings = await self.hass.async_add_executor_job(
+                self.resource.get_readings, t_from, t_to, "PT30M", "sum", utc_offset
+            )
+        except Exception as ex:
+            _LOGGER.warning("Failed to fetch half-hourly export data: %s", ex)
+            return
+
+        if not readings:
+            _LOGGER.debug("No half-hourly export readings returned")
+            return
+
+        # Aggregate half-hourly readings into hourly buckets
+        hourly = {}
+        for ts, val in readings:
+            if isinstance(ts, (int, float)):
+                dt = datetime.utcfromtimestamp(ts).replace(
+                    minute=0, second=0, microsecond=0, tzinfo=dt_util.UTC
+                )
+            else:
+                dt = ts.replace(minute=0, second=0, microsecond=0)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=dt_util.UTC)
+            if dt not in hourly:
+                hourly[dt] = 0.0
+            hourly[dt] += val.value
+
+        if not hourly:
+            return
+
+        # Get last known sum from HA statistics to continue the cumulative total
+        sorted_hours = sorted(hourly.items())
+        earliest = sorted_hours[0][0]
+
+        last_sum = 0.0
+        try:
+            last_stats = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                earliest - timedelta(days=7),
+                earliest,
+                {self._statistic_id},
+                "hour",
+                None,
+                {"sum"},
+            )
+            if (
+                self._statistic_id in last_stats
+                and len(last_stats[self._statistic_id]) > 0
+            ):
+                last_sum = last_stats[self._statistic_id][-1]["sum"]
+                _LOGGER.debug("Last known export sum: %s", last_sum)
+        except Exception as ex:
+            _LOGGER.debug("Could not fetch last statistics: %s", ex)
+
+        # Build statistics entries
+        stats = []
+        cumulative = last_sum
+        for dt, kwh in sorted_hours:
+            cumulative += kwh
+            stats.append(
+                StatisticData(
+                    start=dt,
+                    state=round(kwh, 6),
+                    sum=round(cumulative, 6),
+                )
+            )
+
+        if not stats:
+            return
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=f"{self.resource.classifier} export",
+            source="recorder",
+            statistic_id=self._statistic_id,
+            unit_of_measurement="kWh",
+        )
+
+        _LOGGER.debug(
+            "Importing %d hourly export statistics for %s",
+            len(stats),
+            self._statistic_id,
+        )
+        async_import_statistics(self.hass, metadata, stats)
 
 
 class TariffCoordinator(DataUpdateCoordinator):
@@ -258,21 +371,19 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
 
 
 async def daily_export_data(hass: HomeAssistant, resource) -> float:
-    """Get yesterday's export total from the API.
+    """Get export total from the API, with fallback to yesterday's settled data.
 
-    Export data from the DCC is typically delayed by up to 24 hours,
-    so we fetch yesterday's settled data rather than today's incomplete data.
+    Export data from the DCC is typically delayed by up to 24 hours.
+    We first try to fetch today's data. If the API returns 0 or no data,
+    we fall back to yesterday's settled total so the sensor always shows
+    a meaningful value.
     """
-    _LOGGER.debug("Fetching yesterday's export data")
+    _LOGGER.debug("Fetching export data")
     now = dt_util.utcnow()
     utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
 
     try:
         await hass.async_add_executor_job(resource.catchup)
-        _LOGGER.debug(
-            "Successful GET to https://api.glowmarkt.com/api/v0-1/resource/%s/catchup",
-            resource.id,
-        )
     except HTTPError as ex:
         _LOGGER.error("HTTP Error: %s, Status Code: %s", ex, ex.response.status_code)
     except Timeout as ex:
@@ -282,59 +393,84 @@ async def daily_export_data(hass: HomeAssistant, resource) -> float:
     except Exception as ex:  # pylint: disable=broad-except
         _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
 
-    # Yesterday midnight to today midnight (local time, adjusted to UTC)
+    # Try today's data first (same as daily_data)
     today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
         minutes=utc_offset
     )
-    yesterday_midnight = today_midnight - timedelta(days=1)
+    t_to = now.replace(second=0, microsecond=0)
+    today_value = await _fetch_export_readings(
+        hass, resource, today_midnight, t_to, utc_offset, "today"
+    )
 
+    if today_value is not None and today_value > 0:
+        _LOGGER.debug("Using today's export value: %s", today_value)
+        return today_value
+
+    # Today returned 0 or None — fall back to yesterday's settled data
+    yesterday_midnight = today_midnight - timedelta(days=1)
+    yesterday_value = await _fetch_export_readings(
+        hass, resource, yesterday_midnight, today_midnight, utc_offset, "yesterday"
+    )
+
+    if yesterday_value is not None and yesterday_value > 0:
+        _LOGGER.debug(
+            "Today's export is 0/unavailable, using yesterday's settled value: %s",
+            yesterday_value,
+        )
+        return yesterday_value
+
+    # Both are 0 or None — return today's value (likely genuinely 0)
+    _LOGGER.debug("Both today and yesterday export are 0 or unavailable")
+    return today_value
+
+
+async def _fetch_export_readings(
+    hass: HomeAssistant, resource, t_from, t_to, utc_offset, label: str
+) -> float | None:
+    """Fetch export readings for a given time range."""
     try:
         _LOGGER.debug(
-            "Get export readings from %s to %s for %s",
-            yesterday_midnight,
-            today_midnight,
+            "Get %s export readings from %s to %s for %s",
+            label,
+            t_from,
+            t_to,
             resource.classifier,
         )
         readings = await hass.async_add_executor_job(
-            resource.get_readings,
-            yesterday_midnight,
-            today_midnight,
-            "P1D",
-            "sum",
-            utc_offset,
-        )
-        _LOGGER.debug(
-            "Successfully got export data for resource id %s", resource.id
+            resource.get_readings, t_from, t_to, "P1D", "sum", utc_offset
         )
         if not readings:
-            _LOGGER.debug("No export readings returned for yesterday")
+            _LOGGER.debug("No %s export readings returned", label)
             return None
 
         v = readings[0][1].value
-        _LOGGER.debug(
-            "%s Export reading: %s",
-            resource.classifier,
-            v,
-        )
         if len(readings) > 1:
             v += readings[1][1].value
         return v
     except HTTPError as ex:
         _LOGGER.error(
-            "HTTP Error fetching export data: %s, Status Code: %s",
+            "HTTP Error fetching %s export data: %s, Status Code: %s",
+            label,
             ex,
             ex.response.status_code,
         )
         return None
     except Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
+        _LOGGER.error("Timeout fetching %s export data: %s", label, ex)
         return None
     except ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
+        _LOGGER.error("Cannot connect fetching %s export data: %s", label, ex)
         return None
     except Exception as ex:
-        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+        _LOGGER.exception(
+            "Unexpected exception fetching %s export data: %s. Please open an issue",
+            label,
+            ex,
+        )
         return None
+
+
+async def tariff_data(hass: HomeAssistant, resource):
     """Get tariff data from the API."""
     try:
         tariff = await hass.async_add_executor_job(resource.get_tariff)
@@ -488,19 +624,20 @@ class Cost(GlowDCCSensor):
 class Export(GlowDCCSensor):
     """Sensor object for daily electricity export.
 
-    Shows yesterday's settled export data since DCC export data
-    is typically delayed by up to 24 hours.
+    Shows today's export data when available from the API, falling back
+    to yesterday's settled total when today's data hasn't arrived yet
+    (DCC export data is typically delayed by up to 24 hours).
     """
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_has_entity_name = True
-    _attr_name = "Export (yesterday)"
+    _attr_name = "Export (today)"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_icon = "mdi:solar-power"
 
     def __init__(
-        self, coordinator: DataUpdateCoordinator, resource, virtual_entity
+        self, coordinator: ExportDataCoordinator, resource, virtual_entity
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, resource, virtual_entity)
@@ -508,6 +645,17 @@ class Export(GlowDCCSensor):
         _LOGGER.debug(
             "Created Export sensor with unique_id: %s", self._attr_unique_id
         )
+
+    async def async_added_to_hass(self) -> None:
+        """Register the statistic_id with the coordinator when added to HA."""
+        await super().async_added_to_hass()
+        # Tell the coordinator our entity_id so it can import statistics
+        if hasattr(self.coordinator, "_statistic_id"):
+            self.coordinator._statistic_id = self.entity_id
+            _LOGGER.debug(
+                "Registered statistic_id %s with ExportDataCoordinator",
+                self.entity_id,
+            )
 
     @callback
     def _update_native_value(self, data: float) -> None:
