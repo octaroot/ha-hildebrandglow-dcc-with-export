@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 import logging
 
 import requests
@@ -31,15 +31,175 @@ from .const import CONF_DAILY_INTERVAL, CONF_TARIFF_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+
+# --- EXTERNAL STATISTICS HELPER ---
+
+
+async def _import_external_statistics(
+    hass: HomeAssistant,
+    resource,
+    statistic_id: str,
+    statistic_name: str,
+    imported_hours: set[int],
+) -> None:
+    """Fetch half-hourly data and import as external statistics.
+
+    Uses async_add_external_statistics with a non-recorder source
+    to avoid conflicts with HA's auto-compiled recorder statistics.
+    Tracks imported hours in-memory to avoid duplicate inserts.
+    """
+    try:
+        from homeassistant.components.recorder.models import (
+            StatisticData,
+            StatisticMeanType,
+            StatisticMetaData,
+        )
+        from homeassistant.components.recorder.statistics import (
+            async_add_external_statistics,
+            get_instance,
+            statistics_during_period,
+        )
+    except ImportError:
+        _LOGGER.warning("Recorder statistics API not available, skipping import")
+        return
+
+    try:
+        now = dt_util.utcnow()
+        utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
+
+        t_from = (now - timedelta(days=2)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) + timedelta(minutes=utc_offset)
+        t_to = now.replace(second=0, microsecond=0)
+
+        readings = await hass.async_add_executor_job(
+            resource.get_readings, t_from, t_to, "PT30M", "sum", utc_offset
+        )
+
+        if not readings:
+            _LOGGER.debug("No half-hourly readings returned for %s", statistic_id)
+            return
+
+        # Aggregate into hourly buckets using integer epoch timestamps
+        hourly: dict[int, float] = {}
+        for ts, val in readings:
+            if isinstance(ts, (int, float)):
+                hour_ts = int(ts) // 3600 * 3600
+            else:
+                hour_ts = int(
+                    ts.replace(minute=0, second=0, microsecond=0).timestamp()
+                )
+            hourly[hour_ts] = hourly.get(hour_ts, 0.0) + val.value
+
+        if not hourly:
+            return
+
+        # Skip already-imported hours and the current incomplete hour
+        current_hour_ts = int(
+            now.replace(minute=0, second=0, microsecond=0).timestamp()
+        )
+        new_hours = {
+            ts: kwh
+            for ts, kwh in hourly.items()
+            if ts not in imported_hours and ts != current_hour_ts
+        }
+
+        if not new_hours:
+            _LOGGER.debug("No new completed hours to import for %s", statistic_id)
+            return
+
+        # Get last known cumulative sum
+        sorted_new = sorted(new_hours.items())
+        last_sum = 0.0
+        try:
+            last_stats = await get_instance(hass).async_add_executor_job(
+                statistics_during_period,
+                hass,
+                datetime.utcfromtimestamp(
+                    sorted_new[0][0] - 7 * 86400
+                ).replace(tzinfo=dt_util.UTC),
+                datetime.utcfromtimestamp(sorted_new[0][0]).replace(
+                    tzinfo=dt_util.UTC
+                ),
+                {statistic_id},
+                "hour",
+                None,
+                {"sum"},
+            )
+            if statistic_id in last_stats and len(last_stats[statistic_id]) > 0:
+                last_sum = last_stats[statistic_id][-1]["sum"]
+        except Exception as ex:
+            _LOGGER.debug(
+                "Could not fetch last statistics for %s: %s", statistic_id, ex
+            )
+
+        # Build statistics entries
+        stats = []
+        cumulative = last_sum
+        for hour_ts, kwh in sorted_new:
+            cumulative += kwh
+            dt = datetime.utcfromtimestamp(hour_ts).replace(tzinfo=dt_util.UTC)
+            stats.append(
+                StatisticData(
+                    start=dt,
+                    state=round(kwh, 6),
+                    sum=round(cumulative, 6),
+                )
+            )
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=statistic_name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement="kWh",
+            unit_class="energy",
+        )
+
+        _LOGGER.debug(
+            "Importing %d new external statistics for %s",
+            len(stats),
+            statistic_id,
+        )
+        async_add_external_statistics(hass, metadata, stats)
+
+        # Mark as imported
+        imported_hours.update(new_hours.keys())
+
+    except Exception as ex:
+        _LOGGER.warning(
+            "Failed to import external statistics for %s: %s", statistic_id, ex
+        )
+
+
 # --- COORDINATOR CLASSES ---
 
 
 class DataCoordinator(DataUpdateCoordinator):
-    """Data update coordinator for daily usage and cost sensors."""
+    """Data update coordinator for daily usage and cost sensors.
+
+    Also imports half-hourly data as external statistics for consumption
+    resources (electricity/gas) for proper Energy Dashboard resolution.
+    """
 
     def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
         """Initialize daily data coordinator."""
         self.resource = glowmarkt_resource
+        self._imported_hours: set[int] = set()
+        self._external_stat_id: str | None = None
+        self._external_stat_name: str | None = None
+
+        # Set up external statistics for consumption resources
+        classifier = glowmarkt_resource.classifier
+        if classifier == "electricity.consumption":
+            self._external_stat_id = f"{DOMAIN}:electricity_consumption"
+            self._external_stat_name = "Electricity Consumption"
+        elif classifier == "gas.consumption":
+            self._external_stat_id = f"{DOMAIN}:gas_consumption"
+            self._external_stat_name = "Gas Consumption"
+
         super().__init__(
             hass,
             _LOGGER,
@@ -52,39 +212,51 @@ class DataCoordinator(DataUpdateCoordinator):
         _LOGGER.debug(
             "DataCoordinator updating for resource %s", self.resource.classifier
         )
+
+        # Import external statistics for consumption resources
+        if self._external_stat_id:
+            await _import_external_statistics(
+                self.hass,
+                self.resource,
+                self._external_stat_id,
+                self._external_stat_name,
+                self._imported_hours,
+            )
+
         try:
             value = await daily_data(self.hass, self.resource)
-            # If value is None, do not raise an exception,
-            # which allows the coordinator to keep its previous state.
             if value is None:
                 return None
             return value
         except HTTPError as ex:
             raise UpdateFailed(
-                f"HTTP Error fetching daily data: {ex}, Status Code: {ex.response.status_code}"
+                f"HTTP Error fetching daily data: {ex}, "
+                f"Status Code: {ex.response.status_code}"
             ) from ex
         except Timeout as ex:
             raise UpdateFailed(f"Timeout fetching daily data: {ex}") from ex
         except ConnectionError as ex:
-            raise UpdateFailed(f"Connection error fetching daily data: {ex}") from ex
+            raise UpdateFailed(
+                f"Connection error fetching daily data: {ex}"
+            ) from ex
         except Exception as ex:
             _LOGGER.exception("Unexpected exception fetching daily data: %s", ex)
-            raise UpdateFailed(f"Unknown error fetching daily data: {ex}") from ex
+            raise UpdateFailed(
+                f"Unknown error fetching daily data: {ex}"
+            ) from ex
 
 
 class ExportDataCoordinator(DataUpdateCoordinator):
     """Data update coordinator for export sensors.
 
-    Fetches half-hourly export data and imports it into HA's long-term
-    statistics via async_import_statistics, ensuring data is attributed
-    to the correct timestamps even when the DCC data arrives late.
-    Also provides today's/yesterday's total as a fallback sensor value.
+    Fetches today's/yesterday's value for sensor display, and imports
+    half-hourly data as external statistics for Energy Dashboard use.
     """
 
     def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
         """Initialize export data coordinator."""
         self.resource = glowmarkt_resource
-        self._statistic_id = None  # Set by the Export sensor after creation
+        self._imported_hours: set[int] = set()
         super().__init__(
             hass,
             _LOGGER,
@@ -93,136 +265,23 @@ class ExportDataCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self):
-        """Fetch export data and import historical statistics."""
+        """Fetch export data and import external statistics."""
         _LOGGER.debug(
-            "ExportDataCoordinator updating for resource %s", self.resource.classifier
-        )
-        try:
-            # Import historical half-hourly data into HA statistics
-            if self._statistic_id:
-                await self._import_export_statistics()
-
-            # Also return today's/yesterday's value for the sensor display
-            value = await daily_export_data(self.hass, self.resource)
-            if value is None:
-                return None
-            return value
-        except HTTPError as ex:
-            raise UpdateFailed(
-                f"HTTP Error fetching export data: {ex}, Status Code: {ex.response.status_code}"
-            ) from ex
-        except Timeout as ex:
-            raise UpdateFailed(f"Timeout fetching export data: {ex}") from ex
-        except ConnectionError as ex:
-            raise UpdateFailed(f"Connection error fetching export data: {ex}") from ex
-        except Exception as ex:
-            _LOGGER.exception("Unexpected exception fetching export data: %s", ex)
-            raise UpdateFailed(f"Unknown error fetching export data: {ex}") from ex
-
-    async def _import_export_statistics(self):
-        """Fetch half-hourly export data for the last 2 days and import as statistics."""
-        from homeassistant.components.recorder.models import StatisticData, StatisticMetaData  # noqa: E501
-        from homeassistant.components.recorder.statistics import (
-            async_import_statistics,
-            statistics_during_period,
-            get_instance,
+            "ExportDataCoordinator updating for resource %s",
+            self.resource.classifier,
         )
 
-        now = dt_util.utcnow()
-        utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
-
-        # Fetch last 2 days of half-hourly data to catch delayed DCC data
-        t_from = (now - timedelta(days=2)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) + timedelta(minutes=utc_offset)
-        t_to = now.replace(second=0, microsecond=0)
-
-        try:
-            readings = await self.hass.async_add_executor_job(
-                self.resource.get_readings, t_from, t_to, "PT30M", "sum", utc_offset
-            )
-        except Exception as ex:
-            _LOGGER.warning("Failed to fetch half-hourly export data: %s", ex)
-            return
-
-        if not readings:
-            _LOGGER.debug("No half-hourly export readings returned")
-            return
-
-        # Aggregate half-hourly readings into hourly buckets
-        hourly = {}
-        for ts, val in readings:
-            if isinstance(ts, (int, float)):
-                dt = datetime.utcfromtimestamp(ts).replace(
-                    minute=0, second=0, microsecond=0, tzinfo=dt_util.UTC
-                )
-            else:
-                dt = ts.replace(minute=0, second=0, microsecond=0)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=dt_util.UTC)
-            if dt not in hourly:
-                hourly[dt] = 0.0
-            hourly[dt] += val.value
-
-        if not hourly:
-            return
-
-        # Get last known sum from HA statistics to continue the cumulative total
-        sorted_hours = sorted(hourly.items())
-        earliest = sorted_hours[0][0]
-
-        last_sum = 0.0
-        try:
-            last_stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                earliest - timedelta(days=7),
-                earliest,
-                {self._statistic_id},
-                "hour",
-                None,
-                {"sum"},
-            )
-            if (
-                self._statistic_id in last_stats
-                and len(last_stats[self._statistic_id]) > 0
-            ):
-                last_sum = last_stats[self._statistic_id][-1]["sum"]
-                _LOGGER.debug("Last known export sum: %s", last_sum)
-        except Exception as ex:
-            _LOGGER.debug("Could not fetch last statistics: %s", ex)
-
-        # Build statistics entries
-        stats = []
-        cumulative = last_sum
-        for dt, kwh in sorted_hours:
-            cumulative += kwh
-            stats.append(
-                StatisticData(
-                    start=dt,
-                    state=round(kwh, 6),
-                    sum=round(cumulative, 6),
-                )
-            )
-
-        if not stats:
-            return
-
-        metadata = StatisticMetaData(
-            has_mean=False,
-            has_sum=True,
-            name=f"{self.resource.classifier} export",
-            source="recorder",
-            statistic_id=self._statistic_id,
-            unit_of_measurement="kWh",
+        # Import external statistics
+        await _import_external_statistics(
+            self.hass,
+            self.resource,
+            f"{DOMAIN}:electricity_export",
+            "Electricity Export",
+            self._imported_hours,
         )
 
-        _LOGGER.debug(
-            "Importing %d hourly export statistics for %s",
-            len(stats),
-            self._statistic_id,
-        )
-        async_import_statistics(self.hass, metadata, stats)
+        # Return today's/yesterday's value for the sensor display
+        return await _fetch_export_sensor_value(self.hass, self.resource)
 
 
 class TariffCoordinator(DataUpdateCoordinator):
@@ -246,8 +305,6 @@ class TariffCoordinator(DataUpdateCoordinator):
         try:
             tariff = await tariff_data(self.hass, self.resource)
             if tariff is None:
-                # If tariff_data returns None, it means no data was successfully fetched.
-                # Raise UpdateFailed to mark coordinator unavailable and propagate to sensors.
                 raise UpdateFailed(
                     f"No tariff data received for {self.resource.classifier}"
                 )
@@ -262,7 +319,9 @@ class TariffCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Failed to fetch tariff data: {ex}") from ex
         except Exception as ex:
             _LOGGER.exception(
-                "Error fetching tariff data for %s: %s", self.resource.classifier, ex
+                "Error fetching tariff data for %s: %s",
+                self.resource.classifier,
+                ex,
             )
             raise UpdateFailed(f"Failed to fetch tariff data: {ex}") from ex
 
@@ -278,7 +337,9 @@ def supply_type(resource) -> str:
         return "electricity"
     if "gas.consumption" in resource.classifier:
         return "gas"
-    _LOGGER.error("Unknown classifier: %s. Please open an issue", resource.classifier)
+    _LOGGER.error(
+        "Unknown classifier: %s. Please open an issue", resource.classifier
+    )
     return "unknown"
 
 
@@ -286,10 +347,8 @@ def device_name(resource, virtual_entity) -> str:
     """Return device name. Includes name of virtual entity if it exists."""
     supply = supply_type(resource)
     if virtual_entity.name is not None:
-        name = f"{virtual_entity.name} smart {supply} meter"
-    else:
-        name = f"Smart {supply} meter"
-    return name
+        return f"{virtual_entity.name} smart {supply} meter"
+    return f"Smart {supply} meter"
 
 
 async def daily_data(hass: HomeAssistant, resource) -> float:
@@ -306,7 +365,9 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
             resource.id,
         )
     except HTTPError as ex:
-        _LOGGER.error("HTTP Error: %s, Status Code: %s", ex, ex.response.status_code)
+        _LOGGER.error(
+            "HTTP Error: %s, Status Code: %s", ex, ex.response.status_code
+        )
     except Timeout as ex:
         _LOGGER.error("Timeout: %s", ex)
     except ConnectionError as ex:
@@ -329,9 +390,13 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "P1D", "sum", utc_offset
         )
-        _LOGGER.debug("Successfully got daily usage for resource id %s", resource.id)
         _LOGGER.debug(
-            "Readings for %s has %s entries", resource.classifier, len(readings)
+            "Successfully got daily usage for resource id %s", resource.id
+        )
+        _LOGGER.debug(
+            "Readings for %s has %s entries",
+            resource.classifier,
+            len(readings),
         )
         if not readings:
             _LOGGER.debug("nothing returned")
@@ -366,107 +431,59 @@ async def daily_data(hass: HomeAssistant, resource) -> float:
         _LOGGER.error("Cannot connect: %s", ex)
         return None
     except Exception as ex:
-        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+        _LOGGER.exception(
+            "Unexpected exception: %s. Please open an issue", ex
+        )
         return None
 
 
-async def daily_export_data(hass: HomeAssistant, resource) -> float:
-    """Get export total from the API, with fallback to yesterday's settled data.
-
-    Export data from the DCC is typically delayed by up to 24 hours.
-    We first try to fetch today's data. If the API returns 0 or no data,
-    we fall back to yesterday's settled total so the sensor always shows
-    a meaningful value.
-    """
-    _LOGGER.debug("Fetching export data")
+async def _fetch_export_sensor_value(
+    hass: HomeAssistant, resource
+) -> float | None:
+    """Get export value for sensor display: today if available, else yesterday."""
     now = dt_util.utcnow()
     utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
 
-    try:
-        await hass.async_add_executor_job(resource.catchup)
-    except HTTPError as ex:
-        _LOGGER.error("HTTP Error: %s, Status Code: %s", ex, ex.response.status_code)
-    except Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
-    except ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    except Exception as ex:  # pylint: disable=broad-except
-        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
-
-    # Try today's data first (same as daily_data)
-    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
-        minutes=utc_offset
-    )
+    today_midnight = now.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) + timedelta(minutes=utc_offset)
     t_to = now.replace(second=0, microsecond=0)
-    today_value = await _fetch_export_readings(
-        hass, resource, today_midnight, t_to, utc_offset, "today"
+
+    today_val = await _get_reading(
+        hass, resource, today_midnight, t_to, utc_offset
     )
+    if today_val is not None and today_val > 0:
+        return today_val
 
-    if today_value is not None and today_value > 0:
-        _LOGGER.debug("Using today's export value: %s", today_value)
-        return today_value
-
-    # Today returned 0 or None — fall back to yesterday's settled data
     yesterday_midnight = today_midnight - timedelta(days=1)
-    yesterday_value = await _fetch_export_readings(
-        hass, resource, yesterday_midnight, today_midnight, utc_offset, "yesterday"
+    yesterday_val = await _get_reading(
+        hass, resource, yesterday_midnight, today_midnight, utc_offset
     )
-
-    if yesterday_value is not None and yesterday_value > 0:
+    if yesterday_val is not None and yesterday_val > 0:
         _LOGGER.debug(
-            "Today's export is 0/unavailable, using yesterday's settled value: %s",
-            yesterday_value,
+            "Using yesterday's export value as fallback: %s", yesterday_val
         )
-        return yesterday_value
+        return yesterday_val
 
-    # Both are 0 or None — return today's value (likely genuinely 0)
-    _LOGGER.debug("Both today and yesterday export are 0 or unavailable")
-    return today_value
+    return today_val
 
 
-async def _fetch_export_readings(
-    hass: HomeAssistant, resource, t_from, t_to, utc_offset, label: str
+async def _get_reading(
+    hass: HomeAssistant, resource, t_from, t_to, utc_offset
 ) -> float | None:
-    """Fetch export readings for a given time range."""
+    """Fetch a single daily reading for a time range."""
     try:
-        _LOGGER.debug(
-            "Get %s export readings from %s to %s for %s",
-            label,
-            t_from,
-            t_to,
-            resource.classifier,
-        )
         readings = await hass.async_add_executor_job(
             resource.get_readings, t_from, t_to, "P1D", "sum", utc_offset
         )
         if not readings:
-            _LOGGER.debug("No %s export readings returned", label)
             return None
-
         v = readings[0][1].value
         if len(readings) > 1:
             v += readings[1][1].value
         return v
-    except HTTPError as ex:
-        _LOGGER.error(
-            "HTTP Error fetching %s export data: %s, Status Code: %s",
-            label,
-            ex,
-            ex.response.status_code,
-        )
-        return None
-    except Timeout as ex:
-        _LOGGER.error("Timeout fetching %s export data: %s", label, ex)
-        return None
-    except ConnectionError as ex:
-        _LOGGER.error("Cannot connect fetching %s export data: %s", label, ex)
-        return None
     except Exception as ex:
-        _LOGGER.exception(
-            "Unexpected exception fetching %s export data: %s. Please open an issue",
-            label,
-            ex,
-        )
+        _LOGGER.debug("Error fetching reading: %s", ex)
         return None
 
 
@@ -482,7 +499,9 @@ async def tariff_data(hass: HomeAssistant, resource):
     except UnboundLocalError:
         supply = supply_type(resource)
         _LOGGER.warning(
-            "No tariff data found for %s meter (id: %s). If you don't see tariff data for this meter in the Bright app, please disable the associated rate and standing charge sensors",
+            "No tariff data found for %s meter (id: %s). If you don't see "
+            "tariff data for this meter in the Bright app, please disable "
+            "the associated rate and standing charge sensors",
             supply,
             resource.id,
         )
@@ -502,22 +521,29 @@ async def tariff_data(hass: HomeAssistant, resource):
         return None
     except ConnectionError as ex:
         _LOGGER.error(
-            "Connection error fetching tariff data for %s: %s", resource.classifier, ex
+            "Connection error fetching tariff data for %s: %s",
+            resource.classifier,
+            ex,
         )
         return None
     except Exception as ex:
         _LOGGER.exception(
-            "Unexpected exception fetching tariff data for %s: %s. Please open an issue",
+            "Unexpected exception fetching tariff data for %s: %s. "
+            "Please open an issue",
             resource.classifier,
             ex,
         )
         return None
 
 
-async def _delayed_first_refresh(coordinator: DataUpdateCoordinator, delay: int = 5):
+async def _delayed_first_refresh(
+    coordinator: DataUpdateCoordinator, delay: int = 5
+):
     """Perform first refresh after a delay."""
     _LOGGER.debug(
-        "Scheduling delayed first refresh for %s in %d seconds", coordinator.name, delay
+        "Scheduling delayed first refresh for %s in %d seconds",
+        coordinator.name,
+        delay,
     )
     await asyncio.sleep(delay)
     await coordinator.async_request_refresh()
@@ -561,7 +587,6 @@ class GlowDCCSensor(CoordinatorEntity, SensorEntity, ABC):
     @abstractmethod
     def _update_native_value(self, data):
         """Abstract method to set the native value based on coordinator data."""
-        pass
 
 
 # --- SENSOR CLASSES ---
@@ -582,7 +607,9 @@ class Usage(GlowDCCSensor):
         """Initialize the sensor."""
         super().__init__(coordinator, resource, virtual_entity)
         self._attr_unique_id = f"{resource.id}_usage_today"
-        _LOGGER.debug("Created Usage sensor with unique_id: %s", self._attr_unique_id)
+        _LOGGER.debug(
+            "Created Usage sensor with unique_id: %s", self._attr_unique_id
+        )
 
     @property
     def icon(self) -> str | None:
@@ -613,7 +640,9 @@ class Cost(GlowDCCSensor):
         super().__init__(coordinator, resource, virtual_entity)
         self.meter = None
         self._attr_unique_id = f"{resource.id}_cost_today"
-        _LOGGER.debug("Created Cost sensor with unique_id: %s", self._attr_unique_id)
+        _LOGGER.debug(
+            "Created Cost sensor with unique_id: %s", self._attr_unique_id
+        )
 
     @callback
     def _update_native_value(self, data: float) -> None:
@@ -622,11 +651,11 @@ class Cost(GlowDCCSensor):
 
 
 class Export(GlowDCCSensor):
-    """Sensor object for daily electricity export.
+    """Sensor for daily electricity export.
 
-    Shows today's export data when available from the API, falling back
-    to yesterday's settled total when today's data hasn't arrived yet
-    (DCC export data is typically delayed by up to 24 hours).
+    Shows today's export when the API has data, otherwise falls back to
+    yesterday's settled value (DCC export data can be delayed ~24h).
+    Half-hourly data is imported as external statistics by the coordinator.
     """
 
     _attr_device_class = SensorDeviceClass.ENERGY
@@ -646,17 +675,6 @@ class Export(GlowDCCSensor):
             "Created Export sensor with unique_id: %s", self._attr_unique_id
         )
 
-    async def async_added_to_hass(self) -> None:
-        """Register the statistic_id with the coordinator when added to HA."""
-        await super().async_added_to_hass()
-        # Tell the coordinator our entity_id so it can import statistics
-        if hasattr(self.coordinator, "_statistic_id"):
-            self.coordinator._statistic_id = self.entity_id
-            _LOGGER.debug(
-                "Registered statistic_id %s with ExportDataCoordinator",
-                self.entity_id,
-            )
-
     @callback
     def _update_native_value(self, data: float) -> None:
         """Set the native value for export sensor from coordinator data."""
@@ -664,7 +682,7 @@ class Export(GlowDCCSensor):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Return device information, grouped with the electricity meter."""
+        """Return device information."""
         return DeviceInfo(
             identifiers={(DOMAIN, self.resource.id)},
             manufacturer="Hildebrand",
@@ -687,12 +705,10 @@ class Standing(CoordinatorEntity, SensorEntity):
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
         super().__init__(coordinator)
-
         self._attr_unique_id = f"{resource.id}_standing_charge"
         _LOGGER.debug(
             "Created Standing sensor with unique_id: %s", self._attr_unique_id
         )
-
         self.resource = resource
         self.virtual_entity = virtual_entity
 
@@ -701,7 +717,10 @@ class Standing(CoordinatorEntity, SensorEntity):
         """Handle updated data from the coordinator."""
         if self.coordinator.data:
             value = (
-                float(self.coordinator.data.current_rates.standing_charge.value) / 100
+                float(
+                    self.coordinator.data.current_rates.standing_charge.value
+                )
+                / 100
             )
             self._attr_native_value = round(value, 4)
             self.async_write_ha_state()
@@ -732,10 +751,10 @@ class Rate(CoordinatorEntity, SensorEntity):
     ) -> None:
         """Pass coordinator to CoordinatorEntity."""
         super().__init__(coordinator)
-
         self._attr_unique_id = f"{resource.id}_rate"
-        _LOGGER.debug("Created Rate sensor with unique_id: %s", self._attr_unique_id)
-
+        _LOGGER.debug(
+            "Created Rate sensor with unique_id: %s", self._attr_unique_id
+        )
         self.resource = resource
         self.virtual_entity = virtual_entity
 
@@ -743,7 +762,9 @@ class Rate(CoordinatorEntity, SensorEntity):
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         if self.coordinator.data:
-            value = float(self.coordinator.data.current_rates.rate.value) / 100
+            value = (
+                float(self.coordinator.data.current_rates.rate.value) / 100
+            )
             self._attr_native_value = round(value, 4)
             self.async_write_ha_state()
 
@@ -756,6 +777,114 @@ class Rate(CoordinatorEntity, SensorEntity):
             model="Glow (DCC)",
             name=device_name(self.resource, self.virtual_entity),
         )
+
+
+# --- SETUP HELPERS ---
+
+
+def _setup_consumption_sensors(
+    hass,
+    resource,
+    virtual_entity,
+    daily_interval,
+    tariff_interval,
+    daily_coordinators,
+    tariff_coordinators,
+    entities,
+    meters,
+):
+    """Set up Usage, Standing, and Rate sensors for a consumption resource."""
+    coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
+    if coordinator_key not in daily_coordinators:
+        daily_coordinators[coordinator_key] = DataCoordinator(
+            hass, resource, daily_interval
+        )
+        hass.async_create_task(
+            _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
+        )
+
+    usage_sensor = Usage(
+        daily_coordinators[coordinator_key], resource, virtual_entity
+    )
+    entities.append(usage_sensor)
+    meters[resource.classifier] = usage_sensor
+    _LOGGER.debug("Added Usage sensor for %s", resource.classifier)
+
+    if coordinator_key not in tariff_coordinators:
+        tariff_coordinators[coordinator_key] = TariffCoordinator(
+            hass, resource, tariff_interval
+        )
+        hass.async_create_task(
+            _delayed_first_refresh(tariff_coordinators[coordinator_key], 5)
+        )
+
+    entities.append(
+        Standing(
+            tariff_coordinators[coordinator_key], resource, virtual_entity
+        )
+    )
+    entities.append(
+        Rate(tariff_coordinators[coordinator_key], resource, virtual_entity)
+    )
+    _LOGGER.debug(
+        "Added Standing and Rate sensors for %s", resource.classifier
+    )
+
+
+def _setup_export_sensor(
+    hass,
+    resource,
+    virtual_entity,
+    daily_interval,
+    daily_coordinators,
+    entities,
+):
+    """Set up Export sensor for an electricity export resource."""
+    coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
+    if coordinator_key not in daily_coordinators:
+        daily_coordinators[coordinator_key] = ExportDataCoordinator(
+            hass, resource, daily_interval
+        )
+        hass.async_create_task(
+            _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
+        )
+
+    entities.append(
+        Export(
+            daily_coordinators[coordinator_key], resource, virtual_entity
+        )
+    )
+    _LOGGER.debug("Added Export sensor for %s", resource.classifier)
+
+
+def _setup_cost_sensor(
+    hass,
+    resource,
+    virtual_entity,
+    daily_interval,
+    daily_coordinators,
+    entities,
+    meters,
+):
+    """Set up Cost sensor for a cost resource."""
+    coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
+    if coordinator_key not in daily_coordinators:
+        daily_coordinators[coordinator_key] = DataCoordinator(
+            hass, resource, daily_interval
+        )
+        hass.async_create_task(
+            _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
+        )
+
+    cost_sensor = Cost(
+        daily_coordinators[coordinator_key], resource, virtual_entity
+    )
+    if resource.classifier == "gas.consumption.cost":
+        cost_sensor.meter = meters.get("gas.consumption")
+    elif resource.classifier == "electricity.consumption.cost":
+        cost_sensor.meter = meters.get("electricity.consumption")
+    entities.append(cost_sensor)
+    _LOGGER.debug("Added Cost sensor for %s", resource.classifier)
 
 
 # --- ASYNC SETUP ENTRY FUNCTION ---
@@ -772,9 +901,12 @@ async def async_setup_entry(
     tariff_coordinators: dict[str, TariffCoordinator] = {}
 
     glowmarkt = hass.data[DOMAIN][entry.entry_id]["client"]
-    # Get the daily and tariff intervals from the stored data, with a fallback default.
-    daily_interval = hass.data[DOMAIN][entry.entry_id].get(CONF_DAILY_INTERVAL, 15)
-    tariff_interval = hass.data[DOMAIN][entry.entry_id].get(CONF_TARIFF_INTERVAL, 60)
+    daily_interval = hass.data[DOMAIN][entry.entry_id].get(
+        CONF_DAILY_INTERVAL, 15
+    )
+    tariff_interval = hass.data[DOMAIN][entry.entry_id].get(
+        CONF_TARIFF_INTERVAL, 60
+    )
 
     virtual_entities: dict = {}
     try:
@@ -794,7 +926,9 @@ async def async_setup_entry(
         _LOGGER.error("Failed to get virtual entities: %s", ex)
         return False
     except Exception as ex:
-        _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+        _LOGGER.exception(
+            "Unexpected exception: %s. Please open an issue", ex
+        )
         return False
 
     for virtual_entity in virtual_entities:
@@ -802,9 +936,12 @@ async def async_setup_entry(
         resources: dict = {}
         try:
             _LOGGER.debug(
-                "Fetching resources for virtual entity %s...", virtual_entity.name
+                "Fetching resources for virtual entity %s...",
+                virtual_entity.name,
             )
-            resources = await hass.async_add_executor_job(virtual_entity.get_resources)
+            resources = await hass.async_add_executor_job(
+                virtual_entity.get_resources
+            )
             _LOGGER.debug(
                 "Successful GET to %svirtualentity/%s/resources",
                 glowmarkt.url,
@@ -822,113 +959,59 @@ async def async_setup_entry(
             _LOGGER.error("Failed to get resources: %s", ex)
             continue
         except Exception as ex:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
+            _LOGGER.exception(
+                "Unexpected exception: %s. Please open an issue", ex
+            )
             continue
 
         for resource in resources:
             _LOGGER.debug(
-                "Processing resource with classifier: %s", resource.classifier
+                "Processing resource with classifier: %s",
+                resource.classifier,
             )
-            if resource.classifier in ["electricity.consumption", "gas.consumption"]:
-                coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
-                if coordinator_key not in daily_coordinators:
-                    daily_coordinators[coordinator_key] = DataCoordinator(
-                        hass, resource, daily_interval
-                    )
-                    # Schedule delayed first refresh instead of immediate call
-                    hass.async_create_task(
-                        _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
-                    )
-
-                usage_sensor = Usage(
-                    daily_coordinators[coordinator_key], resource, virtual_entity
+            if resource.classifier in [
+                "electricity.consumption",
+                "gas.consumption",
+            ]:
+                _setup_consumption_sensors(
+                    hass,
+                    resource,
+                    virtual_entity,
+                    daily_interval,
+                    tariff_interval,
+                    daily_coordinators,
+                    tariff_coordinators,
+                    entities,
+                    meters,
                 )
-                entities.append(usage_sensor)
-                meters[resource.classifier] = usage_sensor
-                _LOGGER.debug(
-                    "Added Usage sensor to list for entity %s", resource.classifier
-                )
-
-                if coordinator_key not in tariff_coordinators:
-                    tariff_coordinators[coordinator_key] = TariffCoordinator(
-                        hass, resource, tariff_interval
-                    )
-                    # Schedule delayed first refresh instead of immediate call
-                    hass.async_create_task(
-                        _delayed_first_refresh(tariff_coordinators[coordinator_key], 5)
-                    )
-
-                standing_sensor = Standing(
-                    tariff_coordinators[coordinator_key], resource, virtual_entity
-                )
-                entities.append(standing_sensor)
-                _LOGGER.debug(
-                    "Added Standing sensor to list for entity %s", resource.classifier
-                )
-
-                rate_sensor = Rate(
-                    tariff_coordinators[coordinator_key], resource, virtual_entity
-                )
-                entities.append(rate_sensor)
-                _LOGGER.debug(
-                    "Added Rate sensor to list for entity %s", resource.classifier
-                )
-
             elif resource.classifier == "electricity.export":
-                coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
-                if coordinator_key not in daily_coordinators:
-                    daily_coordinators[coordinator_key] = ExportDataCoordinator(
-                        hass, resource, daily_interval
-                    )
-                    hass.async_create_task(
-                        _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
-                    )
-
-                export_sensor = Export(
-                    daily_coordinators[coordinator_key], resource, virtual_entity
-                )
-                entities.append(export_sensor)
-                _LOGGER.debug(
-                    "Added Export sensor to list for entity %s", resource.classifier
+                _setup_export_sensor(
+                    hass,
+                    resource,
+                    virtual_entity,
+                    daily_interval,
+                    daily_coordinators,
+                    entities,
                 )
 
         for resource in resources:
-            if resource.classifier == "gas.consumption.cost":
-                coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
-                if coordinator_key not in daily_coordinators:
-                    daily_coordinators[coordinator_key] = DataCoordinator(
-                        hass, resource, daily_interval
-                    )
-                    # Schedule delayed first refresh instead of immediate call
-                    hass.async_create_task(
-                        _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
-                    )
-
-                cost_sensor = Cost(
-                    daily_coordinators[coordinator_key], resource, virtual_entity
+            if resource.classifier in [
+                "gas.consumption.cost",
+                "electricity.consumption.cost",
+            ]:
+                _setup_cost_sensor(
+                    hass,
+                    resource,
+                    virtual_entity,
+                    daily_interval,
+                    daily_coordinators,
+                    entities,
+                    meters,
                 )
-                cost_sensor.meter = meters["gas.consumption"]
-                entities.append(cost_sensor)
-                _LOGGER.debug("Added Gas Cost sensor to list.")
-            elif resource.classifier == "electricity.consumption.cost":
-                coordinator_key = f"{virtual_entity.id}_{resource.classifier}"
-                if coordinator_key not in daily_coordinators:
-                    daily_coordinators[coordinator_key] = DataCoordinator(
-                        hass, resource, daily_interval
-                    )
-                    # Schedule delayed first refresh instead of immediate call
-                    hass.async_create_task(
-                        _delayed_first_refresh(daily_coordinators[coordinator_key], 5)
-                    )
 
-                cost_sensor = Cost(
-                    daily_coordinators[coordinator_key], resource, virtual_entity
-                )
-                cost_sensor.meter = meters["electricity.consumption"]
-                entities.append(cost_sensor)
-                _LOGGER.debug("Added Electricity Cost sensor to list.")
-
-    _LOGGER.debug("Calling async_add_entities with %s entities", len(entities))
+    _LOGGER.debug(
+        "Calling async_add_entities with %s entities", len(entities)
+    )
     async_add_entities(entities)
     _LOGGER.debug("async_add_entities call completed.")
 
