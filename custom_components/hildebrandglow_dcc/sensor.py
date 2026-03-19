@@ -40,13 +40,12 @@ async def _import_external_statistics(
     resource,
     statistic_id: str,
     statistic_name: str,
-    imported_hours: set[int],
 ) -> None:
     """Fetch half-hourly data and import as external statistics.
 
-    Uses async_add_external_statistics with a non-recorder source
-    to avoid conflicts with HA's auto-compiled recorder statistics.
-    Tracks imported hours in-memory to avoid duplicate inserts.
+    Uses async_add_external_statistics which upserts (updates existing rows,
+    inserts new ones). Called every poll cycle so data is updated when the
+    DCC settles delayed readings.
     """
     try:
         from homeassistant.components.recorder.models import (
@@ -67,14 +66,48 @@ async def _import_external_statistics(
         now = dt_util.utcnow()
         utc_offset = -int(dt_util.now().utcoffset().total_seconds() / 60)
 
+        # Call catchup first to ensure API has fresh data
+        try:
+            await hass.async_add_executor_job(resource.catchup)
+        except Exception as ex:
+            _LOGGER.debug("Catchup call failed for %s: %s", statistic_id, ex)
+
         t_from = (now - timedelta(days=2)).replace(
             hour=0, minute=0, second=0, microsecond=0
         ) + timedelta(minutes=utc_offset)
         t_to = now.replace(second=0, microsecond=0)
 
-        readings = await hass.async_add_executor_job(
-            resource.get_readings, t_from, t_to, "PT30M", "sum", utc_offset
-        )
+        # Try 2-day window first, fall back to 1-day if API rejects it
+        readings = None
+        try:
+            readings = await hass.async_add_executor_job(
+                resource.get_readings, t_from, t_to, "PT30M", "sum", utc_offset
+            )
+        except Exception as ex:
+            _LOGGER.debug(
+                "2-day PT30M fetch failed for %s, trying 1-day: %s",
+                statistic_id,
+                ex,
+            )
+            t_from_retry = (now - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(minutes=utc_offset)
+            try:
+                readings = await hass.async_add_executor_job(
+                    resource.get_readings,
+                    t_from_retry,
+                    t_to,
+                    "PT30M",
+                    "sum",
+                    utc_offset,
+                )
+            except Exception as ex2:
+                _LOGGER.warning(
+                    "Failed to fetch half-hourly data for %s: %s",
+                    statistic_id,
+                    ex2,
+                )
+                return
 
         if not readings:
             _LOGGER.debug("No half-hourly readings returned for %s", statistic_id)
@@ -94,31 +127,29 @@ async def _import_external_statistics(
         if not hourly:
             return
 
-        # Skip already-imported hours and the current incomplete hour
+        # Skip the current incomplete hour only
         current_hour_ts = int(
             now.replace(minute=0, second=0, microsecond=0).timestamp()
         )
-        new_hours = {
-            ts: kwh
-            for ts, kwh in hourly.items()
-            if ts not in imported_hours and ts != current_hour_ts
+        completed_hours = {
+            ts: kwh for ts, kwh in hourly.items() if ts != current_hour_ts
         }
 
-        if not new_hours:
-            _LOGGER.debug("No new completed hours to import for %s", statistic_id)
+        if not completed_hours:
+            _LOGGER.debug("No completed hours to import for %s", statistic_id)
             return
 
-        # Get last known cumulative sum
-        sorted_new = sorted(new_hours.items())
+        # Get last known cumulative sum before our data window
+        sorted_hours = sorted(completed_hours.items())
         last_sum = 0.0
         try:
             last_stats = await get_instance(hass).async_add_executor_job(
                 statistics_during_period,
                 hass,
                 datetime.utcfromtimestamp(
-                    sorted_new[0][0] - 7 * 86400
+                    sorted_hours[0][0] - 7 * 86400
                 ).replace(tzinfo=dt_util.UTC),
-                datetime.utcfromtimestamp(sorted_new[0][0]).replace(
+                datetime.utcfromtimestamp(sorted_hours[0][0]).replace(
                     tzinfo=dt_util.UTC
                 ),
                 {statistic_id},
@@ -136,7 +167,7 @@ async def _import_external_statistics(
         # Build statistics entries
         stats = []
         cumulative = last_sum
-        for hour_ts, kwh in sorted_new:
+        for hour_ts, kwh in sorted_hours:
             cumulative += kwh
             dt = datetime.utcfromtimestamp(hour_ts).replace(tzinfo=dt_util.UTC)
             stats.append(
@@ -159,14 +190,11 @@ async def _import_external_statistics(
         )
 
         _LOGGER.debug(
-            "Importing %d new external statistics for %s",
+            "Upserting %d external statistics for %s",
             len(stats),
             statistic_id,
         )
         async_add_external_statistics(hass, metadata, stats)
-
-        # Mark as imported
-        imported_hours.update(new_hours.keys())
 
     except Exception as ex:
         _LOGGER.warning(
@@ -187,7 +215,6 @@ class DataCoordinator(DataUpdateCoordinator):
     def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
         """Initialize daily data coordinator."""
         self.resource = glowmarkt_resource
-        self._imported_hours: set[int] = set()
         self._external_stat_id: str | None = None
         self._external_stat_name: str | None = None
 
@@ -220,7 +247,6 @@ class DataCoordinator(DataUpdateCoordinator):
                 self.resource,
                 self._external_stat_id,
                 self._external_stat_name,
-                self._imported_hours,
             )
 
         try:
@@ -256,7 +282,6 @@ class ExportDataCoordinator(DataUpdateCoordinator):
     def __init__(self, hass: HomeAssistant, glowmarkt_resource, daily_interval):
         """Initialize export data coordinator."""
         self.resource = glowmarkt_resource
-        self._imported_hours: set[int] = set()
         super().__init__(
             hass,
             _LOGGER,
@@ -277,7 +302,6 @@ class ExportDataCoordinator(DataUpdateCoordinator):
             self.resource,
             f"{DOMAIN}:electricity_export",
             "Electricity Export",
-            self._imported_hours,
         )
 
         # Return today's/yesterday's value for the sensor display
